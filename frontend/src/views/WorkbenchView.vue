@@ -46,7 +46,14 @@
         </tr>
       </thead>
       <tbody>
-        <tr v-for="row in rows" :key="String(row.id)" :data-testid="`row-${row.id}`" :data-status="String(row.status)">
+        <tr
+          v-for="row in rows"
+          :key="String(row.id)"
+          :data-testid="`row-${row.id}`"
+          :data-status="String(row.status)"
+          :class="{ 'row-selected': Number(row.id) === activeRowId }"
+          @click="activeRowId = Number(row.id)"
+        >
           <td v-for="column in meta.fields" :key="column">{{ row[column] ?? '—' }}</td>
           <td>{{ row.status }}</td>
           <td class="row-actions">
@@ -69,6 +76,15 @@
         </tr>
       </tbody>
     </table>
+
+    <BridgeExpansionPanel
+      v-if="meta.key === 'dim_bridge' && bridgeId"
+      :bridge-id="bridgeId"
+    />
+    <HierarchyExpansionPanel
+      v-if="meta.key === 'hierarchy_build' && expandedHierarchy"
+      :hierarchy-name="expandedHierarchy"
+    />
 
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
@@ -104,6 +120,8 @@ import {
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import BridgeExpansionPanel from '@/views/BridgeExpansionPanel.vue'
+import HierarchyExpansionPanel from '@/views/HierarchyExpansionPanel.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
@@ -115,6 +133,21 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const activeRowId = ref<number | null>(null)
+
+/** 桥接页默认打开“渠道分类分摊桥接”，层级页默认打开“渠道分类层级”。 */
+const bridgeId = computed(() => {
+  const selected = rows.value.find((row) => Number(row.id) === activeRowId.value)
+  if (selected) return Number(selected.id)
+  const preferred = rows.value.find((row) => row['桥接名称'] === '渠道分类分摊桥接')
+  return preferred ? Number(preferred.id) : Number(rows.value[0]?.id ?? 0)
+})
+const expandedHierarchy = computed(() => {
+  const selected = rows.value.find((row) => Number(row.id) === activeRowId.value)
+  if (selected) return String(selected['层级名称'] ?? '')
+  const preferred = rows.value.find((row) => row['层级名称'] === '渠道分类层级')
+  return String((preferred ?? rows.value[0])?.['层级名称'] ?? '')
+})
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },

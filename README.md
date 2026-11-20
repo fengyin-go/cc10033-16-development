@@ -71,6 +71,42 @@ npm run dev
 | 模型校验 | `model_validate` | 校验规则 | 规则名称、目标模型、校验类型 |
 | 部署流水线 | `deploy_pipeline` | 部署任务 | 任务名称、目标模型、部署环境 |
 
+## 层级展开与桥接分摊
+
+层级构建与桥接关联原本只有关系定义，事实分摊缺少可用的明细数据。
+`backend/app/services/hierarchy_expansion.py` 把这段链路补齐：
+
+- **层级关系校验**：按成员分段逐日校验父子关系，发现循环时异常信息直接
+  列出循环成员（如 `CH_OFFLINE → CH_STORE → CH_OFFLINE`），构建动作不会落版本。
+- **成员路径展开**：按业务日期与层级版本计算每个成员的祖先路径、适用日期；
+  同一路径只保留一条，重复祖先路径不会重复参与分摊。
+- **桥接分摊**：每笔源事实按父节点权重展开，展开金额之和必须等于源事实金额；
+  尾差落到权重最大的父节点；重复的桥接权重先按 (成员, 父节点) 去重，避免
+  同一父节点被全额记两遍。
+- **版本与历史更正**：分摊明细登记层级版本、当日有效路径、适用日期和父节点
+  金额。同一事实复算时旧明细置为“已替代”，任一事实不会同时计入两个版本；
+  成员转父日期早于交付日期时，按业务日期回退到当日有效路径并登记更正说明。
+
+示例数据：渠道分类在 2026-11-15 由“平台电商”转到“自营电商”，交付批次 A
+（2026-11-10）与 B（2026-11-16）分别对应转父前后。
+
+```bash
+cd backend && .venv/bin/python -m scripts.demo_midmonth_transfer
+```
+
+接口：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/hierarchy/{层级名称}/validation` | 校验父子关系，循环时返回 422 与循环成员 |
+| GET | `/api/hierarchy/{层级名称}/paths?business_date=` | 成员路径、适用日期、层级版本（可加 `version_label` 固定版本） |
+| GET/POST | `/api/hierarchy/{层级名称}/versions` | 查询或发布层级版本快照 |
+| POST | `/api/hierarchy/bridges/{id}/expansion` | 按交付日期与复算日期执行桥接分摊 |
+| GET | `/api/hierarchy/bridges/{id}/expansion?status=有效` | 查询分摊明细与交付总额 |
+
+前端在“层级构建”和“桥接关联”页面的列表下方提供了展开面板
+（`HierarchyExpansionPanel.vue` / `BridgeExpansionPanel.vue`）。
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。

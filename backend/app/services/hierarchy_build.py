@@ -3,14 +3,21 @@
 增强能力：
 - 消费 dim.published/attr.confirmed 通道获取层级构建上下文
 - 三种层级模式：父子字段(parent_id)、层级路径(path_string)、桥接表(bridge_table)
-- 递归深度检测：防止循环引用
+- 递归深度检测：防止循环引用，异常信息列出循环成员
 - 扁平化转换：将树形层级转换为列式属性
+- 构建/重建时落层级版本快照，并向桥接关联交付父子关系展开结果
 """
 from __future__ import annotations
 
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.hierarchy_expansion import (
+    HierarchyCycleError,
+    HierarchyError,
+    build_hierarchy_snapshot,
+    member_path_records,
+)
 from app.store import store
 
 LEVEL_MODES = {"父子字段", "层级路径", "桥接表"}
@@ -81,24 +88,78 @@ class HierarchyBuildService(BaseModuleService):
         )
         return entry, []
 
-    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+    def run_action(
+        self,
+        entry_id: int,
+        action: str,
+        *,
+        built_on: str | None = None,
+        version_label: str | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
+        target = self.ACTION_RULES.get(action)
+        if target is None:
+            return None, f"动作「{action}」不属于{self.MODULE}可执行范围"
+
+        if action in ("构建层级", "重建层级"):
+            # 构建必须基于真实父子关系数据；循环或缺失数据时保持原状态不变。
+            try:
+                version = build_hierarchy_snapshot(
+                    entry["层级名称"],
+                    built_on=built_on,
+                    version_label=version_label,
+                    reason=action,
+                )
+            except HierarchyCycleError as exc:
+                entry["pending"] = True
+                entry["abnormal"] = True
+                store.channel.publish("hierarchy.validation_failed", {
+                    "hierarchy_name": entry["层级名称"],
+                    "cycles": exc.cycles,
+                    "message": str(exc),
+                    "entry_id": entry_id,
+                })
+                return None, str(exc)
+            except HierarchyError as exc:
+                entry["pending"] = True
+                entry["abnormal"] = True
+                return None, str(exc)
+
         entry, message = super().run_action(entry_id, action)
         if entry is None:
             return None, message
 
         if action == "构建层级":
             tree = _build_hierarchy_tree(entry)
+            entry["status"] = "已构建"
+            entry["pending"] = False
+            entry["abnormal"] = False
+            entry["层级版本"] = version["层级版本"]
+            entry["_paths"] = member_path_records(entry["层级名称"], version["构建日期"], version=version)
             store.channel.publish("hierarchy.built", {
                 "hierarchy_name": entry["层级名称"],
                 "tree_nodes": tree["node_count"],
+                "version": version["层级版本"],
+                "built_on": version["构建日期"],
                 "entry_id": entry_id,
             })
         elif action == "重建层级":
             _rebuild_hierarchy(entry)
+            entry["status"] = "已重建"
+            entry["pending"] = False
+            entry["abnormal"] = False
+            entry["层级版本"] = version["层级版本"]
+            entry["_paths"] = member_path_records(entry["层级名称"], version["构建日期"], version=version)
             store.channel.publish("hierarchy.rebuilt", {
                 "hierarchy_name": entry["层级名称"],
+                "version": version["层级版本"],
+                "built_on": version["构建日期"],
                 "entry_id": entry_id,
             })
+        if action in ("构建层级", "重建层级"):
+            return entry, f"{self.ENTITY}已{action}，生成层级版本 {entry.get('层级版本')}"
         return entry, message
 
     def domain_snapshot(self) -> dict[str, Any]:
@@ -109,6 +170,8 @@ class HierarchyBuildService(BaseModuleService):
             mode_dist[mode] = mode_dist.get(mode, 0) + 1
         base["mode_distribution"] = mode_dist
         base["consumed_dims"] = len(store.channel.consume("dim.published", "hierarchy_build"))
+        base["versions"] = len(store.rows("hierarchy_version"))
+        base["member_relations"] = len(store.rows("hierarchy_member"))
         return base
 
 

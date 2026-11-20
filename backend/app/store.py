@@ -316,6 +316,16 @@ class ArtifactRegistry:
         return {"total": len(self._artifacts), "by_type": by_type, "by_module": by_module}
 
 
+# 层级展开链路使用的内部事实表，不作为一个独立业务模块展示。
+INTERNAL_TABLES = {
+    "hierarchy_member",
+    "hierarchy_version",
+    "bridge_member_weight",
+    "bridge_source_fact",
+    "bridge_expansion_detail",
+}
+
+
 class Store:
     def __init__(self) -> None:
         self._tables: dict[str, list[dict[str, Any]]] = {
@@ -327,7 +337,7 @@ class Store:
         self.artifacts = ArtifactRegistry()
 
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        return sorted(name for name in self._tables if name not in INTERNAL_TABLES)
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])

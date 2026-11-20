@@ -4,7 +4,8 @@
 - 消费 dim.published 和 fact.published 通道校验多对多关系
 - 权重字段验证（权重值范围）
 - 时效性管理：生效/失效时间与主记录标记
-- 桥接表数据生成模拟
+- 消费层级构建交付的父子关系展开事实，登记成员到父节点的分摊结果
+- 分摊明细登记层级版本与适用日期，同一业务日复算时旧明细置为已替代
 """
 from __future__ import annotations
 
@@ -12,6 +13,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.hierarchy_expansion import (
+    BridgeAllocationError,
+    HierarchyCycleError,
+    HierarchyError,
+    find_hierarchy,
+    publish_bridge_expansion,
+)
 from app.store import store
 
 
@@ -46,6 +54,15 @@ class DimBridgeService(BaseModuleService):
         if entry is None:
             return None, missing
 
+        # 层级名称不在固定列表字段里，但展开时需要它指向层级构建产物。
+        hierarchy_name = str(values.get("层级名称", "")).strip()
+        if hierarchy_name:
+            entry["层级名称"] = hierarchy_name
+            try:
+                find_hierarchy(hierarchy_name)
+            except HierarchyError:
+                entry["abnormal"] = True
+
         store.channel.publish("bridge.defined", {
             "bridge_name": entry["桥接名称"],
             "dims": many_dims,
@@ -79,10 +96,64 @@ class DimBridgeService(BaseModuleService):
             })
         return entry, message
 
+    def expand_facts(
+        self,
+        entry_id: int,
+        delivery_date: str,
+        *,
+        as_of: str | None = None,
+        fact_ids: list[str] | None = None,
+        reason: str = "桥接展开",
+    ) -> tuple[dict[str, Any] | None, str]:
+        """按层级构建交付的父子关系展开事实，登记父节点分摊结果。
+
+        交付日期用来选择层级版本与源事实批次；每笔事实再按自己的业务日期
+        解析当日有效路径，转父前后的分摊可以同时还原。
+        """
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
+        if entry.get("status") == "已失效":
+            return None, f"桥接「{entry.get('桥接名称')}」已失效，不能执行分摊"
+        try:
+            result = publish_bridge_expansion(
+                entry["桥接名称"],
+                delivery_date,
+                as_of=as_of,
+                fact_ids=fact_ids,
+                reason=reason,
+            )
+        except HierarchyCycleError as exc:
+            entry["abnormal"] = True
+            return None, str(exc)
+        except HierarchyError as exc:
+            entry["abnormal"] = True
+            return None, f"层级关系校验失败：{exc}"
+        except BridgeAllocationError as exc:
+            entry["abnormal"] = True
+            return None, str(exc)
+
+        entry["abnormal"] = not result["金额守恒"]
+        entry["最近交付日期"] = result["交付日期"]
+        entry["最近复算日期"] = result["复算日期"]
+        entry["父节点分摊"] = result["父节点分摊"]
+        entry["历史更正数"] = len(result["历史更正"])
+        entry["最近分摊批次"] = result["复算批次"]
+        entry["最近分摊金额"] = result["分摊总额"]
+        entry["层级版本"] = result["层级版本"]
+        return result, (
+            f"桥接「{result['桥接名称']}」按层级版本 {result['层级版本']} 展开 "
+            f"{result['事实笔数']} 笔事实，分摊金额 {result['分摊总额']} 与源事实总额 "
+            f"{result['源事实总额']} 相等，替代旧明细 {len(result['替代明细'])} 条"
+        )
+
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()
         active = sum(1 for r in store.rows(self.MODULE) if r.get("status") == "已生效")
         base["active_bridges"] = active
+        details = store.rows("bridge_expansion_detail")
+        base["expansion_details"] = len(details)
+        base["expansion_valid"] = sum(1 for row in details if row.get("状态") == "有效")
         return base
 
 
